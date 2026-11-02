@@ -1,0 +1,6 @@
+faster-whisper==1.2.1
+# PyAV 16+ breaks faster-whisper 1.2.1 (metadata_errors argument removed)
+av==15.1.0
+# CUDA libraries for GPU on Windows
+nvidia-cublas-cu12
+nvidia-cudnn-cu12==9.*

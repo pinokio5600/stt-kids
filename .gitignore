@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 아이들 음성·이름이 들어간 데이터 (공개 저장소에 올리지 않음)
+audio/
+outputs/
+reports/
+
+# 기타
+.vscode/
+.idea/
+*.log
