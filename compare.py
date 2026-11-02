@@ -15,9 +15,9 @@ from pathlib import Path
 import numpy as np
 
 import transcribe  # noqa: F401  (sets up CUDA DLLs on Windows)
-from transcribe import collect_files, is_hallucination
+from transcribe import boost_quiet, collect_files, is_hallucination, load_audio, undo_loops
 from faster_whisper import WhisperModel
-from faster_whisper.audio import decode_audio, pad_or_trim
+from faster_whisper.audio import pad_or_trim
 from faster_whisper.tokenizer import Tokenizer
 
 SR = 16000
@@ -33,25 +33,35 @@ def norm(word):
     return NUMBERS.get(w, w)
 
 
-def script_words(text):
+def script_words(text, extra_names=()):
     words = []
-    for raw in text.split():
-        n = norm(raw)
-        if n:
-            words.append({"text": raw, "norm": n})
+    for line_no, line in enumerate(text.splitlines()):
+        for raw in line.split():
+            n = norm(raw)
+            if n:
+                words.append({"text": raw, "norm": n, "line": line_no})
+
+    # Names (Philoctetes, Pegasus, Dario...) are often mis-heard even when read well,
+    # so they are left out of the accuracy score. A capitalised word in mid-sentence is a name;
+    # every other occurrence of it counts too.
+    names = {norm(x) for x in extra_names}
+    for prev, w in zip(words, words[1:]):
+        if (w["text"][0].isupper() and w["norm"] not in {"i", "i'm", "i'll", "i've", "i'd"}
+                and prev["line"] == w["line"] and not prev["text"].endswith((".", "!", "?", ":"))):
+            names.add(w["norm"])
+    for w in words:
+        w["name"] = w["norm"] in names
     return words
 
 
-def transcribe_words(model, audio, args):
-    segments, _ = model.transcribe(
-        audio,
-        language="en",
-        beam_size=5,
-        vad_filter=True,
-        condition_on_previous_text=False,
-        temperature=0.0,
-        word_timestamps=True,
-    )
+def transcribe_words(model, raw, args):
+    opts = dict(language="en", beam_size=5, condition_on_previous_text=False,
+                temperature=0.0, word_timestamps=True)
+    if args.no_boost:
+        segments, _ = model.transcribe(raw, vad_filter=True, **opts)
+    else:
+        segments, _ = model.transcribe(boost_quiet(raw), vad_filter=True, **opts)
+        segments = undo_loops(model, segments, raw, **opts)
     words = []
     for seg in segments:
         if is_hallucination(seg.words, args.drop_p):
@@ -59,8 +69,60 @@ def transcribe_words(model, audio, args):
         for w in seg.words:
             n = norm(w.word)
             if n:
-                words.append({"text": w.word.strip(), "norm": n, "start": w.start, "end": w.end})
+                words.append({"text": w.word.strip(), "norm": n, "start": w.start, "end": w.end,
+                              "p": w.probability})
     return words
+
+
+# Score weights and the ranges that map a measurement to 0..1 of its points.
+WEIGHTS = {"accuracy": 60, "fluency": 25, "clarity": 15}
+WPM_RANGE = (80, 160)      # words per minute inside a sentence: 80 or less -> 0, 160 or more -> full
+PAUSE_SEC = 1.5            # a stop this long inside a sentence counts as hesitation
+PAUSE_COST = 0.2           # each hesitation takes 20% of the pause half of fluency
+CLARITY_RANGE = (0.8, 0.96)  # average model confidence on correctly read words
+GRADES = [(85, "A"), (70, "B"), (0, "C")]  # provisional: tune against teacher grades
+MIN_HEARD = 0.3            # heard fewer words than 30% of the script -> can't score
+
+
+def scale(x, lo, hi):
+    return min(max((x - lo) / (hi - lo), 0.0), 1.0)
+
+
+def score_reading(ref, hyp, correct, pairs):
+    """pairs: (ref index, hyp index) for words read exactly as written."""
+    if len(hyp) < MIN_HEARD * len(ref):
+        return None
+
+    content = [i for i, w in enumerate(ref) if not w["name"]]
+    accuracy = sum(correct[i] for i in content) / len(content) if content else 0
+
+    # Fluency is measured within each script line only: the gap between lines
+    # may just be waiting for the next character's turn in the video.
+    by_line = {}
+    for i, j in pairs:
+        by_line.setdefault(ref[i]["line"], []).append((i, j))
+    words = span = pauses = 0
+    for line_pairs in by_line.values():
+        if len(line_pairs) < 2:
+            continue
+        (i_a, j_a), (i_b, j_b) = line_pairs[0], line_pairs[-1]
+        words += i_b - i_a + 1
+        span += hyp[j_b]["end"] - hyp[j_a]["start"]
+        pauses += sum(hyp[j + 1]["start"] - hyp[j]["end"] >= PAUSE_SEC for j in range(j_a, j_b))
+    wpm = words / span * 60 if span > 0 else 0
+    fluency = 0.5 * scale(wpm, *WPM_RANGE) + 0.5 * max(0.0, 1 - PAUSE_COST * pauses)
+
+    probs = [hyp[j]["p"] for _, j in pairs]
+    confidence = sum(probs) / len(probs) if probs else 0
+    clarity = scale(confidence, *CLARITY_RANGE)
+
+    parts = {"accuracy": accuracy, "fluency": fluency, "clarity": clarity}
+    points = {k: parts[k] * WEIGHTS[k] for k in WEIGHTS}
+    total = sum(points.values())
+    grade = next(g for cut, g in GRADES if total >= cut)
+    return {"total": total, "grade": grade, "points": points, "accuracy": accuracy,
+            "n_content": len(content), "n_names": len(ref) - len(content),
+            "wpm": wpm, "pauses": pauses, "confidence": confidence}
 
 
 class Scorer:
@@ -161,9 +223,15 @@ def main():
     p.add_argument("--drop-p", type=float, default=0.3)
     p.add_argument("--pass-gap", type=float, default=-1.0,
                    help="Script wording within this log-prob of the transcript -> model mis-heard")
+    p.add_argument("--max-pass-words", type=int, default=3,
+                   help="Only differences up to this many words can be passed as mis-hearing")
+    p.add_argument("--no-boost", action="store_true", help="Don't raise quiet stretches")
+    p.add_argument("--names", default="",
+                   help="Extra names to leave out of accuracy, comma separated (e.g. Altman,Dario)")
     args = p.parse_args()
 
-    ref = script_words(Path(args.script).read_text(encoding="utf-8"))
+    ref = script_words(Path(args.script).read_text(encoding="utf-8"),
+                       [n.strip() for n in args.names.split(",") if n.strip()])
     files = collect_files(args.input)
     if not files:
         sys.exit(f"No audio/video files found in {args.input}")
@@ -176,15 +244,22 @@ def main():
 
     summary = []
     for f in files:
-        audio = decode_audio(str(f), SR)
+        audio = load_audio(f)
         hyp = transcribe_words(model, audio, args)
 
         matched = 0
         rows = []
+        correct = [False] * len(ref)
+        pairs = []
         for op, rs, hs in compare(ref, hyp):
             n_ref = rs[1] - rs[0]
             if op == "equal":
                 matched += n_ref
+                correct[rs[0]:rs[1]] = [True] * n_ref
+                if n_ref == hs[1] - hs[0]:
+                    pairs += zip(range(*rs), range(*hs))
+                else:  # "cyberattacks" vs "cyber attacks": only the ends line up
+                    pairs += [(rs[0], hs[0]), (rs[1] - 1, hs[1] - 1)]
                 continue
             said = phrase(hyp, *hs)
             script = phrase(ref, *rs)
@@ -202,21 +277,41 @@ def main():
                 # Saying nothing fits the audio best: mumbled or skipped.
                 kind = "불분명/빠뜨림"
                 verdict = "확인 필요"
-            elif check and check["gap"] >= args.pass_gap:
+            elif (check and check["gap"] >= args.pass_gap
+                  # A long stretch that differs is not a slip of the model's ear.
+                  and max(n_ref, hs[1] - hs[0]) <= args.max_pass_words):
                 verdict = "통과 (모델이 잘못 들음)"
                 if op != "insert":
                     matched += n_ref
+                    correct[rs[0]:rs[1]] = [True] * n_ref
             else:
                 verdict = "확인 필요"
             rows.append({"t": t, "kind": kind, "script": script, "said": said,
                          "verdict": verdict, "check": check})
 
         rate = matched / len(ref) * 100 if ref else 0
-        summary.append((f.stem, rate, sum(r["verdict"] == "확인 필요" for r in rows)))
+        pairs.sort()
+        s = score_reading(ref, hyp, correct, pairs)
+        todo = sum(r["verdict"] == "확인 필요" for r in rows)
+        summary.append((f.stem, rate, todo, s))
 
-        lines = [f"# {f.stem}", "", f"대본 일치율: **{rate:.0f}%** ({matched}/{len(ref)} 단어)", "",
-                 "| 시간 | 유형 | 대본 | 아이가 읽은 것(받아쓰기) | 판정 | 점수 차 |",
-                 "|---|---|---|---|---|---|"]
+        lines = [f"# {f.stem}", ""]
+        if s is None:
+            lines += ["## 점수: **채점 불가** (목소리가 거의 들리지 않음 → 녹음 확인 필요)", ""]
+        else:
+            pt = s["points"]
+            lines += [
+                f"## 점수: **{s['total']:.0f}점 ({s['grade']})**", "",
+                "| 항목 | 점수 | 근거 |", "|---|---|---|",
+                f"| 정확도 | {pt['accuracy']:.0f}/{WEIGHTS['accuracy']} | 대본 단어 {s['accuracy'] * 100:.0f}% 맞게 읽음"
+                f" (이름 {s['n_names']}개는 제외) |",
+                f"| 유창성 | {pt['fluency']:.0f}/{WEIGHTS['fluency']} | 문장 안 속도 분당 {s['wpm']:.0f}단어,"
+                f" {PAUSE_SEC}초 이상 멈춤 {s['pauses']}번 |",
+                f"| 명확도 | {pt['clarity']:.0f}/{WEIGHTS['clarity']} | 맞게 읽은 단어의 평균 인식 확신도"
+                f" {s['confidence']:.2f} |", ""]
+        lines += [f"대본 일치율: **{rate:.0f}%** ({matched}/{len(ref)} 단어)", "",
+                  "| 시간 | 유형 | 대본 | 아이가 읽은 것(받아쓰기) | 판정 | 점수 차 |",
+                  "|---|---|---|---|---|---|"]
         for r in rows:
             gap = f"{r['check']['gap']:+.2f}" if r["check"] else "-"
             lines.append(f"| {r['t']:.1f}s | {r['kind']} | {r['script'] or '-'} | {r['said'] or '-'} "
@@ -224,12 +319,24 @@ def main():
         lines += ["", "## 받아쓰기 전문", "", " ".join(w["text"] for w in hyp), ""]
         report = out_dir / f"{f.stem}.md"
         report.write_text("\n".join(lines), encoding="utf-8")
-        print("\n".join(lines[:4 + 3 + len(rows)]))
-        print(f"-> {report}\n")
+        print(f"-> {report}")
 
-    print("=== 요약 ===")
-    for name, rate, todo in summary:
-        print(f"{name}: 일치율 {rate:.0f}%, 확인 필요 {todo}곳")
+    # One table for the whole class; utf-8-sig so Excel shows Korean correctly.
+    csv_rows = ["이름,점수,등급,정확도,유창성,명확도,일치율(%),분당 단어,멈춤,확인 필요"]
+    print("\n=== 요약 ===")
+    for name, rate, todo, s in sorted(summary, key=lambda x: -(x[3]["total"] if x[3] else -1)):
+        if s is None:
+            print(f"{name}: 채점 불가 (녹음 확인)")
+            csv_rows.append(f'"{name}",,채점 불가,,,,{rate:.0f},,,{todo}')
+            continue
+        pt = s["points"]
+        print(f"{name}: {s['total']:.0f}점 {s['grade']}  (정확도 {pt['accuracy']:.0f} / 유창성 "
+              f"{pt['fluency']:.0f} / 명확도 {pt['clarity']:.0f})  분당 {s['wpm']:.0f}단어, "
+              f"멈춤 {s['pauses']}, 확신도 {s['confidence']:.2f}")
+        csv_rows.append(f'"{name}",{s["total"]:.0f},{s["grade"]},{pt["accuracy"]:.1f},{pt["fluency"]:.1f},'
+                        f'{pt["clarity"]:.1f},{rate:.0f},{s["wpm"]:.0f},{s["pauses"]},{todo}')
+    (out_dir / "scores.csv").write_text("\n".join(csv_rows) + "\n", encoding="utf-8-sig")
+    print(f"-> {out_dir / 'scores.csv'}")
 
 
 if __name__ == "__main__":

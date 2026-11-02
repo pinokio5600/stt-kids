@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -18,9 +19,56 @@ def add_cuda_dlls():
 
 add_cuda_dlls()
 
+import numpy as np  # noqa: E402
 from faster_whisper import WhisperModel  # noqa: E402
+from faster_whisper.audio import decode_audio  # noqa: E402
 
 AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".mp4", ".webm", ".ogg", ".flac", ".mov", ".aac"}
+SR = 16000
+
+
+def boost_quiet(audio, target_db=-20, max_gain_db=30, floor_db=-65, win=0.5):
+    """Raise quiet stretches toward target_db, half a second at a time.
+    Children often start softly; without this, silence filtering drops their first lines.
+    Stretches below floor_db are treated as silence and left alone."""
+    n = int(SR * win)
+    db = np.array([20 * np.log10(np.sqrt(np.mean(audio[i:i + n] ** 2)) + 1e-9)
+                   for i in range(0, len(audio), n)])
+    # Average with neighbours so the gain doesn't jump in the middle of a word.
+    db = np.convolve(np.pad(db, 2, mode="edge"), np.ones(5) / 5, mode="valid")
+    gain_db = np.clip(target_db - db, 0, max_gain_db)
+    gain_db[db < floor_db] = 0
+    gain = np.repeat(10 ** (gain_db / 20), n)[: len(audio)]
+    gain = np.convolve(gain, np.ones(n) / n, mode="same")
+    return np.clip(audio * gain, -1, 1).astype(np.float32)
+
+
+def load_audio(path):
+    return decode_audio(str(path), SR)
+
+
+LOOP_RATIO = 2.4  # faster-whisper's own threshold for "text repeats itself"
+
+
+def undo_loops(model, segments, raw, **opts):
+    """Boosting also raises background noise, which can make the model loop
+    ("I couldn't do it, I couldn't do it, ..."). Redo those segments on the original audio."""
+    for seg in segments:
+        if seg.compression_ratio <= LOOP_RATIO:
+            yield seg
+            continue
+        print(f"[{seg.start:6.2f}s -> {seg.end:6.2f}s] (repeating text, retrying on original audio)")
+        # Cut the range out and keep silence filtering on: long pauses also cause loops.
+        piece = raw[int(seg.start * SR): int(seg.end * SR)]
+        redo, _ = model.transcribe(piece, vad_filter=True, **opts)
+        for r in redo:
+            if r.compression_ratio > LOOP_RATIO:
+                # Still looping: the audio itself is unclear. Leave it out so a teacher checks it.
+                print(f"[{r.start + seg.start:6.2f}s -> {r.end + seg.start:6.2f}s] (dropped, repeating) {r.text.strip()[:60]}")
+                continue
+            words = [replace(w, start=w.start + seg.start, end=w.end + seg.start)
+                     for w in (r.words or [])]
+            yield replace(r, start=r.start + seg.start, end=r.end + seg.start, words=words)
 
 
 def fmt_ts(t):
@@ -76,6 +124,7 @@ def main():
     parser.add_argument("--beam", type=int, default=5)
     parser.add_argument("--prompt", default=None, help="Hint text: script excerpt or key words")
     parser.add_argument("--no-vad", action="store_true", help="Disable silence filtering")
+    parser.add_argument("--no-boost", action="store_true", help="Don't raise quiet stretches")
     parser.add_argument("--flag-p", type=float, default=0.5,
                         help="Words below this confidence are marked [word?] in .review.txt")
     parser.add_argument("--drop-p", type=float, default=0.3,
@@ -96,6 +145,8 @@ def main():
     for f in files:
         print(f"\n=== {f.name} ===")
         start = time.time()
+        raw = load_audio(f)
+        audio = raw if args.no_boost else boost_quiet(raw)
         common = dict(
             language=args.lang,
             beam_size=args.beam,
@@ -104,13 +155,15 @@ def main():
             word_timestamps=True,
         )
         segments, info = model.transcribe(
-            str(f),
+            audio,
             vad_filter=not args.no_vad,
             # hotwords is applied to every 30s window; initial_prompt only reaches the first one
             # when condition_on_previous_text=False
             hotwords=args.prompt,
             **common,
         )
+        if not args.no_boost:
+            segments = undo_loops(model, segments, raw, **common)
 
         final = []
         for seg in segments:
@@ -121,7 +174,7 @@ def main():
                 redo_start = final[-1].end if final else 0.0
                 print(f"[{redo_start:6.2f}s -> {seg.end:6.2f}s] (hint echoed, retrying without hints)")
                 redo, _ = model.transcribe(
-                    str(f), vad_filter=False, clip_timestamps=[redo_start, seg.end], **common
+                    audio, vad_filter=False, clip_timestamps=[redo_start, seg.end], **common
                 )
                 final.extend(redo)
             else:
